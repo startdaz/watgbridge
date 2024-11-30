@@ -1,10 +1,7 @@
-{ lib
-, buildGoApplication
-, enableFfmpeg ? true
-, enableLibWebPTools ? true
-, ffmpeg
-, libwebp
-, nix-filter
+{
+  lib,
+  buildGoApplication,
+  nix-filter,
 }:
 
 let
@@ -28,26 +25,23 @@ let
     ];
   };
 
-in buildGoApplication rec {
+in
+buildGoApplication rec {
   pname = "watgbridge";
-  version = "1.9.0";
+  version = "1.11.0";
 
   pwd = localSrc;
   src = localSrc;
 
-  buildInputs = [
-  ] ++ lib.optionals enableFfmpeg [
-    ffmpeg
-  ] ++ lib.optionals enableLibWebPTools [
-    libwebp
+  ldflags = [
+    "-s"
+    "-w"
   ];
-
-  ldflags = [ "-s" "-w" ];
 
   meta = with lib; rec {
     description = "A bridge between WhatsApp and Telegram written in Golang";
     homepage = "https://github.com/watgbridge/watgbridge";
-    changelog = "${homepage}/compare/watgbridge-v${version}...main";
+    changelog = "${homepage}/compare/v${version}...main";
     license = licenses.mit;
     mainProgram = "watgbridge";
   };

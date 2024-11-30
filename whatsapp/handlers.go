@@ -48,6 +48,9 @@ func WhatsAppEventHandler(evt interface{}) {
 	case *events.PushName:
 		PushNameEventHandler(v)
 
+	case *events.UserAbout:
+		UserAboutEventHandler(v)
+
 	case *events.CallOffer:
 		CallOfferEventHandler(v)
 
@@ -286,6 +289,11 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 				zap.String("event_id", v.Info.ID),
 			)
 			contextInfo = v.Message.GetVideoMessage().GetContextInfo()
+		} else if v.Message.GetPtvMessage() != nil {
+			logger.Debug("taking context info from PtvMessage",
+				zap.String("event_id", v.Info.ID),
+			)
+			contextInfo = v.Message.GetPtvMessage().GetContextInfo()
 		} else if v.Message.GetAudioMessage() != nil {
 			logger.Debug("taking context info from AudioMessage",
 				zap.String("event_id", v.Info.ID),
@@ -496,6 +504,7 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 				ReplyParameters: &gotgbot.ReplyParameters{
 					MessageId: replyToMsgId,
 				},
+				HasSpoiler:      imageMsg.GetViewOnce(),
 				MessageThreadId: threadId,
 			})
 			if sentMsg.MessageId != 0 {
@@ -582,9 +591,17 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 			return
 		}
 
-	} else if v.Message.GetVideoMessage() != nil {
+	} else if v.Message.GetVideoMessage() != nil || v.Message.GetPtvMessage() != nil {
 
-		videoMsg := v.Message.GetVideoMessage()
+		var videoMsg *waE2E.VideoMessage = nil
+		isPtvMsg := false
+		if v.Message.GetVideoMessage() != nil {
+			videoMsg = v.Message.GetVideoMessage()
+		} else {
+			videoMsg = v.Message.GetPtvMessage()
+			isPtvMsg = true
+		}
+
 		if videoMsg.GetURL() == "" {
 			return
 		}
@@ -645,13 +662,25 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 				Data: bytes.NewReader(videoBytes),
 			}
 
-			sentMsg, _ := tgBot.SendVideo(cfg.Telegram.TargetChatID, &fileToSend, &gotgbot.SendVideoOpts{
-				Caption: bridgedText,
-				ReplyParameters: &gotgbot.ReplyParameters{
-					MessageId: replyToMsgId,
-				},
-				MessageThreadId: threadId,
-			})
+			var sentMsg *gotgbot.Message = nil
+			if isPtvMsg {
+				sentMsg, _ = tgBot.SendVideoNote(cfg.Telegram.TargetChatID, &fileToSend, &gotgbot.SendVideoNoteOpts{
+					ReplyMarkup: replyMarkup,
+					ReplyParameters: &gotgbot.ReplyParameters{
+						MessageId: replyToMsgId,
+					},
+					MessageThreadId: threadId,
+				})
+			} else {
+				sentMsg, _ = tgBot.SendVideo(cfg.Telegram.TargetChatID, &fileToSend, &gotgbot.SendVideoOpts{
+					Caption: bridgedText,
+					ReplyParameters: &gotgbot.ReplyParameters{
+						MessageId: replyToMsgId,
+					},
+					HasSpoiler:      videoMsg.GetViewOnce(),
+					MessageThreadId: threadId,
+				})
+			}
 			if sentMsg.MessageId != 0 {
 				database.MsgIdAddNewPair(msgId, v.Info.MessageSource.Sender.String(), v.Info.Chat.String(),
 					cfg.Telegram.TargetChatID, sentMsg.MessageId, sentMsg.MessageThreadId)
@@ -1163,6 +1192,45 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 
 	} else {
 		if text == "" {
+			if reactionMsg := v.Message.GetReactionMessage(); cfg.Telegram.Reactions && reactionMsg != nil {
+				tgChatId, _, tgMsgId, err := database.MsgIdGetTgFromWa(reactionMsg.Key.GetID(), v.Info.Chat.String())
+				if err != nil {
+					logger.Error(
+						"failed to get message ID mapping from database",
+						zap.Error(err),
+						zap.String("stanza_id", reactionMsg.Key.GetID()),
+						zap.String("chat_id", v.Info.Chat.String()),
+					)
+				} else if tgChatId == cfg.Telegram.TargetChatID {
+
+					if *reactionMsg.Text != "" {
+						text = fmt.Sprintf(
+							"<code>Reacted to this message with %s</code>",
+							html.EscapeString(*reactionMsg.Text),
+						)
+					} else {
+						text = "<code>Revoked their reaction to this message</code>"
+					}
+
+					bridgedText += text
+
+					sentMsg, err := tgBot.SendMessage(cfg.Telegram.TargetChatID, bridgedText, &gotgbot.SendMessageOpts{
+						ReplyParameters: &gotgbot.ReplyParameters{
+							MessageId: tgMsgId,
+						},
+						MessageThreadId: threadId,
+					})
+					if err != nil {
+						panic(fmt.Errorf("failed to send telegram message: %s", err))
+					}
+					if sentMsg.MessageId != 0 {
+						database.MsgIdAddNewPair(msgId, v.Info.MessageSource.Sender.String(), v.Info.Chat.String(),
+							cfg.Telegram.TargetChatID, sentMsg.MessageId, sentMsg.MessageThreadId)
+					}
+				}
+
+			}
+
 			return
 		}
 
@@ -1243,6 +1311,72 @@ func PushNameEventHandler(v *events.PushName) {
 	)
 
 	database.ContactUpdatePushName(v.JID.User, v.NewPushName)
+}
+
+func UserAboutEventHandler(v *events.UserAbout) {
+	var (
+		cfg    = state.State.Config
+		logger = state.State.Logger
+		tgBot  = state.State.TelegramBot
+	)
+	defer logger.Sync()
+
+	logger.Debug("new user_about update",
+		zap.String("jid", v.JID.String()),
+		zap.String("new_status", v.Status),
+		zap.Time("updated_at", v.Timestamp),
+	)
+
+	tgThreadId, threadFound, err := database.ChatThreadGetTgFromWa(v.JID.ToNonAD().String(), cfg.Telegram.TargetChatID)
+	if err != nil {
+		logger.Warn(
+			"failed to find thread for a WhatsApp chat (handling UserAbout event)",
+			zap.String("chat", v.JID.String()),
+			zap.Error(err),
+		)
+		return
+	}
+	if !threadFound || tgThreadId == 0 {
+		logger.Warn(
+			"no thread found for a WhatsApp chat (handling UserAbout event)",
+			zap.String("chat", v.JID.String()),
+		)
+		if !cfg.WhatsApp.CreateThreadForInfoUpdates {
+			return
+		}
+	}
+
+	tgThreadId, err = utils.TgGetOrMakeThreadFromWa(v.JID.ToNonAD().String(), cfg.Telegram.TargetChatID, utils.WaGetContactName(v.JID.ToNonAD()))
+	if err != nil {
+		logger.Warn(
+			"failed to create a new thread for a WhatsApp chat (handling UserAbout event)",
+			zap.String("chat", v.JID.String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	updateMessageText := "User's about message was updated"
+	if time.Since(v.Timestamp).Seconds() > 60 {
+		updateMessageText += fmt.Sprintf(
+			"at %s:\n\n",
+			html.EscapeString(
+				v.Timestamp.
+					In(state.State.LocalLocation).
+					Format(cfg.TimeFormat),
+			),
+		)
+	} else {
+		updateMessageText += ":\n\n"
+	}
+
+	updateMessageText += fmt.Sprintf("<code>%s</code>", html.EscapeString(v.Status))
+
+	tgBot.SendMessage(
+		cfg.Telegram.TargetChatID,
+		updateMessageText,
+		&gotgbot.SendMessageOpts{MessageThreadId: tgThreadId},
+	)
 }
 
 func RevokedMessageEventHandler(v *events.Message) {
